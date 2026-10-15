@@ -1100,6 +1100,8 @@ class ChatWindow(QDialog):
         self.provider_label.setObjectName("provider-label")
         self.provider_label.setMaximumWidth(150)
         self.provider_label.setToolTip(self.settings.active_config.model)
+        self.provider_label.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse | Qt.TextInteractionFlag.LinksAccessibleByKeyboard)
+        self.provider_label.linkActivated.connect(lambda _link: self._focus_auth_settings())
         header_status_layout.addWidget(self.provider_label)
         header_status_layout.addStretch(1)
         title_text.addWidget(self.header_status)
@@ -1804,7 +1806,8 @@ class ChatWindow(QDialog):
         try:
             prepared = prepare_request(self.config)
         except (CredentialError, PermissionError, ValueError, OSError) as error:
-            self.provider_label.setText(configuration_hint(error))
+            self.provider_label.setToolTip(configuration_hint(error))
+            self.provider_label.setText(configuration_hint(error, actionable=callable(self._auth_callback)))
             return
         self.input.clear()
         self.composer.clear_attachments()
@@ -1845,7 +1848,8 @@ class ChatWindow(QDialog):
         try:
             self.settings, config = prepared or prepare_request(self.config)
         except (CredentialError, PermissionError, ValueError, OSError) as error:
-            self.provider_label.setText(configuration_hint(error))
+            self.provider_label.setToolTip(configuration_hint(error))
+            self.provider_label.setText(configuration_hint(error, actionable=callable(self._auth_callback)))
             return
         self._typewriter_timer.stop()
         self._pending_output = ""
@@ -1876,6 +1880,8 @@ class ChatWindow(QDialog):
         self.activateWindow()
 
     def _focus_auth_settings(self) -> None:
+        if not self.service.accepting:
+            return
         if callable(self._auth_callback):
             self._auth_callback()
         else:

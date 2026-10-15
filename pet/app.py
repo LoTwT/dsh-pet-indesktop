@@ -1424,8 +1424,14 @@ class AppShell:
         # 没有实例时返回 None，包按"不跟随桌宠"的安全默认开窗。
         from .ai_bindings import register_ai_pet_view
 
-        register_ai_pet_view(self._ai_pet_view)
+        register_ai_pet_view(self._ai_pet_view, notifier=self.system_notify, auth_callback=self._open_ai_package_settings)
         return runtime
+
+    def _open_ai_package_settings(self):
+        """DLC 聊天包只导航到自己的设置；复用独立设置进程/进程内的既有入口。"""
+        instance = getattr(self, "instance", None)
+        if instance is not None:
+            instance.open_modern_settings(initial_page="extension:official.ai-chat")
 
     def _ai_pet_view(self):
         """聊天包的桌宠呈现面：主实例的聊天宿主（拿不到就是 None，不伪造几何）。"""
