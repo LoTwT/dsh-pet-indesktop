@@ -1431,6 +1431,18 @@ class AppShell:
         """DLC 聊天包只导航到自己的设置；复用独立设置进程/进程内的既有入口。"""
         instance = getattr(self, "instance", None)
         if instance is not None:
+            if bool(self.config.get("settings_process_isolation", True)) and (
+                self._settings_process_running() or self._settings_launch_pending()
+            ):
+                from .settings_extension_navigation import AiSettingsRequest
+
+                pending = getattr(self, "_ai_settings_request", None)
+                if pending is None or pending.finished:
+                    self._ai_settings_request = AiSettingsRequest(
+                        self.config.dir,
+                        lambda: self.system_notify("扩展设置", "未能打开 AI 扩展设置，请关闭已有设置窗口后重试。"),
+                    )
+                return
             instance.open_modern_settings(initial_page="extension:official.ai-chat")
 
     def _ai_pet_view(self):

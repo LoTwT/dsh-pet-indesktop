@@ -208,3 +208,205 @@ def test_settings_process_cold_start_selects_the_ai_owner_without_importing_pet_
                             capture_output=True, text=True, timeout=90)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "owner settings visible" in result.stdout
+
+
+def test_existing_settings_process_navigates_and_preserves_the_owner_draft(installed, tmp_path):
+    shell, _manager, mount = installed
+    shell.config.set("settings_process_isolation", True)
+    window = mount.chat()
+    window.input.setPlainText("保留这条尚未发送的问题")
+    window.send_message()
+    script = textwrap.dedent('''
+        import json, sys, traceback
+        from pathlib import Path
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QApplication
+        from pet.__main__ import _exec_settings
+        from pet.config import Config
+        root = Path(sys.argv[1])
+        app = QApplication([])
+        phase, original = 0, None
+        def publish(name, value):
+            temp = root / (name + ".tmp")
+            temp.write_text(json.dumps(value), encoding="utf-8")
+            temp.replace(root / name)
+        def inspect():
+            global phase, original
+            try:
+                dialog = next(w for w in app.topLevelWidgets() if hasattr(w, "mod_panel_owner"))
+                if phase == 0:
+                    assert dialog.sidebar.currentItem().text() == "常规"
+                    dialog.showMaximized()
+                    publish("settings-ready.json", {})
+                    phase = 1
+                elif dialog.sidebar.currentItem().text() == "扩展管理" and dialog.mod_panel_owner == "official.ai-chat":
+                    assert "pet.app" not in sys.modules
+                    assert dialog.isMaximized(), "Navigation changed the existing window state"
+                    panel = dialog.mod_panel
+                    assert panel.component.page.key.isVisibleTo(dialog)
+                    if phase == 1:
+                        original = panel
+                        panel.component.page.key.setText("unsaved-test-draft")
+                        dialog.select_page("常规")
+                        publish("settings-first.json", {"owner": panel.owner})
+                        phase = 2
+                    else:
+                        assert panel is original
+                        assert panel.component.page.key.text() == "unsaved-test-draft"
+                        publish("settings-second.json", {"owner": panel.owner, "draft_retained": True})
+                        app.quit()
+            except Exception:
+                traceback.print_exc()
+                app.exit(1)
+        timer = QTimer()
+        timer.setInterval(20)
+        timer.timeout.connect(inspect)
+        timer.start()
+        raise SystemExit(_exec_settings(app, Config(base=root), include_ai=False))
+    ''')
+    with (tmp_path / "settings-child.log").open("w") as log:
+        child = subprocess.Popen([sys.executable, "-u", "-c", script, str(tmp_path)],
+                                 stdout=log, stderr=subprocess.STDOUT,
+                                 env=dict(os.environ, QT_QPA_PLATFORM="offscreen"))
+        try:
+            pump(lambda: (tmp_path / "settings-ready.json").exists() or child.poll() is not None)
+            assert child.poll() is None, (tmp_path / "settings-child.log").read_text()
+            click_settings_link(window)
+            pump(lambda: (tmp_path / "settings-first.json").exists() or child.poll() is not None)
+            assert (tmp_path / "settings-first.json").exists(), (tmp_path / "settings-child.log").read_text()
+            click_settings_link(window)
+            pump(lambda: child.poll() is not None)
+            assert child.returncode == 0, (tmp_path / "settings-child.log").read_text()
+            assert json.loads((tmp_path / "settings-second.json").read_text())["draft_retained"]
+            assert shell.instance.modern_settings_dialog is None
+            assert not shell._toast_windows, "Successful navigation must not show the busy notice"
+        finally:
+            if child.poll() is None:
+                child.terminate()
+                child.wait(timeout=10)
+
+
+def test_navigation_waits_for_the_settings_process_to_acquire_its_lock(installed):
+    from PySide6.QtCore import QLockFile
+
+    from pet.settings_extension_navigation import AiSettingsReceiver, AiSettingsRequest
+
+    shell, _manager, _mount = installed
+    shell.instance.open_modern_settings()
+    dialog = shell.instance.modern_settings_dialog
+    failures = []
+    request = AiSettingsRequest(shell.config.dir, lambda: failures.append(True))
+    # The click can happen after process launch but before the child acquires its lock.
+    lock = QLockFile(str(shell.config.dir / "settings.lock"))
+    assert lock.tryLock(0)
+    receiver = AiSettingsReceiver(shell.config.dir, dialog)
+    try:
+        pump(lambda: request.finished)
+        assert not failures
+        pump(lambda: dialog.mod_panel_owner == OWNER)
+    finally:
+        receiver.close()
+        lock.unlock()
+
+
+@pytest.mark.parametrize("payload", [b"unknown-route\n", b"ai-settings\n" + b"x" * 256])
+def test_navigation_receiver_refuses_unknown_or_oversized_commands(installed, payload):
+    from PySide6.QtCore import QLockFile
+    from PySide6.QtNetwork import QLocalSocket
+
+    from pet.settings_extension_navigation import AiSettingsReceiver
+
+    shell, _manager, _mount = installed
+    shell.instance.open_modern_settings()
+    dialog = shell.instance.modern_settings_dialog
+    lock = QLockFile(str(shell.config.dir / "settings.lock"))
+    assert lock.tryLock(0)
+    receiver = AiSettingsReceiver(shell.config.dir, dialog)
+    assert receiver.server.isListening()
+    socket = QLocalSocket()
+    connected = []
+    socket.connected.connect(lambda: (connected.append(True), socket.write(payload)))
+    try:
+        socket.connectToServer(receiver.server.fullServerName())
+        pump(lambda: socket.state() == QLocalSocket.LocalSocketState.UnconnectedState)
+        assert connected
+        assert dialog.sidebar.currentItem().text() == "常规"
+        assert dialog.mod_panel is None
+        assert bytes(socket.readAll()) == b""
+    finally:
+        socket.abort()
+        receiver.close()
+        lock.unlock()
+
+
+def test_navigation_unavailable_reports_failure_once_and_finishes(tmp_path):
+    from pet.settings_extension_navigation import AiSettingsRequest
+
+    failures = []
+    request = AiSettingsRequest(tmp_path, lambda: failures.append(True), timeout_ms=200)
+    pump(lambda: request.finished)
+    app.processEvents()
+    assert failures == [True]
+
+
+@pytest.mark.parametrize("state", ["disabled", "enabled"], ids=["saved-off", "saved-on"])
+def test_notification_uses_the_preference_saved_during_a_request(installed, state):
+    shell, _manager, mount = installed
+    received, release = threading.Event(), threading.Event()
+
+    class Unauthorized(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            received.set()
+            if not release.wait(timeout=40):
+                return
+            body = b'{"error":{"message":"invalid API key"}}'
+            self.send_response(401)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Unauthorized)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    background = QWidget()
+    try:
+        config = mount.runtime.config
+        settings = config.chat_settings()
+        provider = settings.active_config
+        provider.base_url = f"http://127.0.0.1:{server.server_port}"
+        provider.api_key_ref = config.save_provider_secret(provider, "test-only-key")
+        config.set_chat_settings(settings)
+        config.set("system_notifications_enabled", state == "disabled")
+        config.save()
+        window = mount.chat()
+        background.show()
+        background.activateWindow()
+        pump(background.isActiveWindow)
+        window.hide()
+        window.input.setPlainText("change the notification preference during this request")
+        window.send_message()
+        pump(received.is_set)
+        shell.instance.open_modern_settings(initial_page="extension:official.ai-chat")
+        pump(lambda: shell.instance.modern_settings_dialog is not None)
+        panel = shell.instance.modern_settings_dialog.mod_panel
+        panel.component.page.system_notify_check.setChecked(state == "enabled")
+        QTest.mouseClick(panel.save_button, Qt.MouseButton.LeftButton)
+        assert not panel.dirty()
+        # A later unsaved draft must neither change notification behavior nor be lost.
+        panel.component.page.key.setText("unsaved-test-draft")
+        panel.component.page.system_notify_check.setChecked(state != "enabled")
+        release.set()
+        pump(lambda: window.service.is_drained)
+        assert bool(shell._toast_windows) == (state == "enabled")
+        assert panel.component.page.key.text() == "unsaved-test-draft"
+        assert panel.dirty()
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=10)
+        background.close()
